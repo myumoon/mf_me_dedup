@@ -47,7 +47,7 @@ def _reserve_group(
         match_day = min(available, key=lambda day: (card_day - day).days)
         used.add((key, match_day))
         return match_day, False
-    return None, bool(groups) and not amount_matches
+    return None, bool(groups) and not available
 
 
 def match(rows: list[dict], since: date, lookback_days: int = 90) -> list[Result]:
