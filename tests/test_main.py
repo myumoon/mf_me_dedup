@@ -1,4 +1,4 @@
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from types import SimpleNamespace
@@ -27,13 +27,28 @@ def row(row_id, *, transfer="0", description="ショップA 楽天市場店 ラ�
 
 @pytest.fixture
 def runtime(monkeypatch):
-    page = SimpleNamespace(screenshot=Mock())
+    page = SimpleNamespace(closed=False, screenshots_before_close=[])
+
+    def screenshot(*, path):
+        if page.closed:
+            raise RuntimeError("page is closed")
+        page.screenshots_before_close.append(path)
+
+    page.screenshot = Mock(side_effect=screenshot)
     context = object()
     login = Mock()
     fetch_rows = Mock()
     set_transfer = Mock()
     match = Mock(return_value=[])
-    monkeypatch.setattr(cli, "_browser_session", lambda headed: nullcontext((page, context)))
+
+    @contextmanager
+    def browser_session(headed):
+        try:
+            yield page, context
+        finally:
+            page.closed = True
+
+    monkeypatch.setattr(cli, "_browser_session", browser_session)
     monkeypatch.setattr(cli.mf, "login", login)
     monkeypatch.setattr(cli.mf, "fetch_rows", fetch_rows)
     monkeypatch.setattr(cli.mf, "set_transfer", set_transfer)
@@ -165,6 +180,16 @@ def test_exception_text_does_not_expose_credentials(runtime, secret):
     assert secret not in str(error.value)
     assert secret not in output.getvalue()
     runtime.page.screenshot.assert_called_once_with(path="artifacts/error.png")
+
+
+def test_error_screenshot_is_captured_before_browser_session_closes(runtime):
+    runtime.login.side_effect = RuntimeError("login failed")
+
+    with pytest.raises(RuntimeError):
+        cli.main([])
+
+    assert runtime.page.closed
+    assert runtime.page.screenshots_before_close == ["artifacts/error.png"]
 
 
 def test_default_since_and_fetch_range_use_jst_today(runtime, monkeypatch):
