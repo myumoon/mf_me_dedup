@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI
+.claude/
+
+# Local
+.env/
+.obsidian/
+*.back
+*.bak
+*.temp
+*.tmp
