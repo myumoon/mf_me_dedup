@@ -201,4 +201,7 @@ def test_job_summary_receives_result_table(runtime, monkeypatch, tmp_path):
 
     assert code == 0
     assert "MATCH=1" in output
-    assert "| 日付 | 内容 | 金額（円） | 判定 | 市場明細日 |" in summary.read_text(encoding="utf-8")
+    content = summary.read_text(encoding="utf-8")
+    assert "| 日付 | 内容 | 金額（円） | 判定 | 市場明細日 |" in content
+    assert "password-secret" not in output + content
+    assert "totp-secret" not in output + content
