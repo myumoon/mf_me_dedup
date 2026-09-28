@@ -168,6 +168,28 @@ def test_case_09_equal_amount_outside_lookback_is_mismatch():
     ]
 
 
+def test_used_equal_amount_group_does_not_hide_mismatch():
+    result = match(
+        [
+            card(
+                "2025-08-08",
+                "ショップE",
+                -4000,
+                calculated="0",
+                transfer="1",
+            ),
+            market("2025-08-06", "ショップE 消耗品", -4000),
+            card("2025-09-05", "ショップE", -4000),
+            market("2025-09-03", "ショップE 消耗品", -3500),
+        ],
+        date(2025, 9, 1),
+    )
+
+    assert [(item.kind, item.market_date) for item in result] == [
+        ("AMOUNT_MISMATCH", None)
+    ]
+
+
 def test_case_10_excluded_market_row_is_not_a_candidate():
     result = match(
         [
@@ -198,14 +220,18 @@ def test_case_11_processed_card_is_omitted():
     assert result == []
 
 
-def test_old_unprocessed_card_reserves_group_but_is_not_returned():
-    result = match(
-        [
-            card("2025-09-16", "ショップL", -1000),
-            market("2025-08-30", "ショップL 商品", -1000),
-            card("2025-09-01", "ショップL", -1000),
-        ],
-        date(2025, 9, 16),
-    )
+def test_old_unprocessed_card_reserves_group_and_later_card_is_mismatch():
+    rows = [
+        card("2025-09-16", "ショップL", -1000),
+        market("2025-08-30", "ショップL 商品", -1000),
+        card("2025-09-01", "ショップL", -1000),
+    ]
 
-    assert result == []
+    for since in (date(2025, 9, 1), date(2025, 9, 16)):
+        result = match(rows, since)
+
+        assert [
+            (item.kind, item.market_date)
+            for item in result
+            if item.card["日付"] == "2025/09/16"
+        ] == [("AMOUNT_MISMATCH", None)]
