@@ -100,48 +100,51 @@ def main(argv: list[str] | None = None) -> int:
     changed = 0
     try:
         with _browser_session(args.headed) as (page, context):
-            mf.login(page, credentials["MF_EMAIL"], credentials["MF_PASSWORD"], credentials["MF_TOTP_SECRET"])
-            if args.login_only:
-                return 0
+            try:
+                mf.login(page, credentials["MF_EMAIL"], credentials["MF_PASSWORD"], credentials["MF_TOTP_SECRET"])
+                if args.login_only:
+                    return 0
 
-            rows = mf.fetch_rows(context, start, today)
-            results = rakuten.match(rows, since)
-            _write_table(results)
-            if args.dry_run:
+                rows = mf.fetch_rows(context, start, today)
+                results = rakuten.match(rows, since)
+                _write_table(results)
+                if args.dry_run:
+                    _print_counts(results, changed)
+                    return int(any(result.kind == "AMOUNT_MISMATCH" for result in results))
+
+                matches = [result for result in results if result.kind == "MATCH"]
+                if len(matches) > args.max_changes:
+                    _print_counts(results, changed)
+                    print("MATCH count exceeds --max-changes", file=sys.stderr)
+                    return 1
+
+                before_ids = {row["ID"] for row in rows}
+                before_transfer = {row["ID"] for row in rows if row["振替"] == "1"}
+                for result in matches:
+                    mf.set_transfer(page, result.card, "楽天市場(my Rakuten)")
+                    changed += 1
+
+                if matches:
+                    after = mf.fetch_rows(context, start, today)
+                    after_ids = {row["ID"] for row in after}
+                    common_ids = before_ids & after_ids
+                    after_transfer = {row["ID"] for row in after if row["振替"] == "1"}
+                    delta = (before_transfer & common_ids) ^ (after_transfer & common_ids)
+                    target_ids = {result.card["ID"] for result in matches}
+                    if delta != target_ids:
+                        raise RuntimeError("Transfer ID verification failed")
+
                 _print_counts(results, changed)
                 return int(any(result.kind == "AMOUNT_MISMATCH" for result in results))
-
-            matches = [result for result in results if result.kind == "MATCH"]
-            if len(matches) > args.max_changes:
-                _print_counts(results, changed)
-                print("MATCH count exceeds --max-changes", file=sys.stderr)
-                return 1
-
-            before_ids = {row["ID"] for row in rows}
-            before_transfer = {row["ID"] for row in rows if row["振替"] == "1"}
-            for result in matches:
-                mf.set_transfer(page, result.card, "楽天市場(my Rakuten)")
-                changed += 1
-
-            if matches:
-                after = mf.fetch_rows(context, start, today)
-                after_ids = {row["ID"] for row in after}
-                common_ids = before_ids & after_ids
-                after_transfer = {row["ID"] for row in after if row["振替"] == "1"}
-                delta = (before_transfer & common_ids) ^ (after_transfer & common_ids)
-                target_ids = {result.card["ID"] for result in matches}
-                if delta != target_ids:
-                    raise RuntimeError("Transfer ID verification failed")
-
-            _print_counts(results, changed)
-            return int(any(result.kind == "AMOUNT_MISMATCH" for result in results))
-    except Exception as error:
-        if page is not None:
-            try:
-                Path("artifacts").mkdir(parents=True, exist_ok=True)
-                page.screenshot(path="artifacts/error.png")
             except Exception:
-                pass
+                if page is not None:
+                    try:
+                        Path("artifacts").mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path="artifacts/error.png")
+                    except Exception:
+                        pass
+                raise
+    except Exception as error:
         message = str(error)
         for secret in credentials.values():
             if secret:
