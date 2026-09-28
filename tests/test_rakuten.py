@@ -11,7 +11,7 @@ def row(
     *,
     calculated: str = "1",
     transfer: str = "0",
-    row_id: str,
+    row_id: str | None = None,
 ) -> dict[str, str]:
     return {
         "計算対象": calculated,
@@ -23,7 +23,7 @@ def row(
         "中項目": "",
         "メモ": "",
         "振替": transfer,
-        "ID": row_id,
+        "ID": row_id if row_id is not None else f"{account}:{day}:{description}:{amount}",
     }
 
 
