@@ -154,13 +154,16 @@ def test_new_rows_are_excluded_from_transfer_delta(runtime):
     assert code == 0
 
 
-def test_exception_text_does_not_expose_password(runtime):
-    runtime.login.side_effect = RuntimeError("password-secret")
+@pytest.mark.parametrize("secret", ["password-secret", "totp-secret"])
+def test_exception_text_does_not_expose_credentials(runtime, secret):
+    runtime.login.side_effect = RuntimeError(secret)
+    output = StringIO()
 
-    with pytest.raises(RuntimeError) as error:
-        invoke([])
+    with redirect_stdout(output), pytest.raises(RuntimeError) as error:
+        cli.main([])
 
-    assert "password-secret" not in str(error.value)
+    assert secret not in str(error.value)
+    assert secret not in output.getvalue()
     runtime.page.screenshot.assert_called_once_with(path="artifacts/error.png")
 
 
@@ -185,3 +188,17 @@ def test_today_is_read_in_fixed_jst(runtime, monkeypatch):
     cli._jst_today()
 
     now.assert_called_once_with(timezone(timedelta(hours=9)))
+
+
+def test_job_summary_receives_result_table(runtime, monkeypatch, tmp_path):
+    card = row("card-1")
+    runtime.fetch_rows.return_value = [card]
+    runtime.match.return_value = [matched(card)]
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    code, output, _ = invoke(["--dry-run"])
+
+    assert code == 0
+    assert "MATCH=1" in output
+    assert "| 日付 | 内容 | 金額（円） | 判定 | 市場明細日 |" in summary.read_text(encoding="utf-8")
