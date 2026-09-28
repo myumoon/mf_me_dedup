@@ -1,0 +1,12 @@
+[project]
+name = "mf-me-dedup"
+version = "0.1.0"
+description = "Remove duplicate MoneyForward ME entries for Rakuten purchases"
+requires-python = ">=3.12,<3.13"
+dependencies = ["playwright", "pyotp"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
