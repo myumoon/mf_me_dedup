@@ -29,7 +29,6 @@ def row(row_id, *, transfer="0", description="ショップA 楽天市場店 ラ�
 def runtime(monkeypatch):
     page = SimpleNamespace(screenshot=Mock())
     context = object()
-    browser = Mock()
     login = Mock()
     fetch_rows = Mock()
     set_transfer = Mock()
@@ -45,7 +44,6 @@ def runtime(monkeypatch):
     return SimpleNamespace(
         page=page,
         context=context,
-        browser=browser,
         login=login,
         fetch_rows=fetch_rows,
         set_transfer=set_transfer,
@@ -53,7 +51,7 @@ def runtime(monkeypatch):
     )
 
 
-def invoke(args, *, clear_output=True):
+def invoke(args):
     stdout, stderr = StringIO(), StringIO()
     with redirect_stdout(stdout), redirect_stderr(stderr):
         code = cli.main(args)
@@ -174,7 +172,9 @@ def test_default_since_and_fetch_range_use_jst_today(runtime, monkeypatch):
     code, _, _ = invoke(["--dry-run"])
 
     assert code == 0
-    runtime.fetch_rows.assert_called_once_with(today - timedelta(days=120), today)
+    runtime.fetch_rows.assert_called_once_with(
+        runtime.context, today - timedelta(days=120), today
+    )
     runtime.match.assert_called_once_with([], today - timedelta(days=30))
 
 
