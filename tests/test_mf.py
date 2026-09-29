@@ -298,6 +298,32 @@ def test_login_waits_five_minutes_for_the_top_page(monkeypatch):
     page.wait_for_url.assert_called_once_with(mf.TOP_URL, timeout=5 * 60 * 1000)
 
 
+@pytest.mark.parametrize("box", ["メールアドレス", "パスワード", "認証コード（数字6桁）"])
+def test_login_errors_do_not_contain_filled_values(monkeypatch, box):
+    page = MagicMock()
+    monkeypatch.setattr(mf.time, "sleep", lambda seconds: None)
+    code = mf.pyotp.TOTP("JBSWY3DPEHPK3PXP").now()
+    filled = {"メールアドレス": "user@example.test", "パスワード": "hunter2-pass", "認証コード（数字6桁）": code}
+
+    def get_by_role(role, name=None, **kwargs):
+        locator = MagicMock()
+        if role == "textbox" and name == box:
+            locator.fill.side_effect = TimeoutError(
+                f'Locator.fill: Timeout 30000ms exceeded.\nCall log:\n  - fill("{filled[box]}")'
+            )
+        return locator
+
+    page.get_by_role.side_effect = get_by_role
+    with pytest.raises(RuntimeError) as error:
+        mf.login(page, filled["メールアドレス"], filled["パスワード"], "JBSWY3DPEHPK3PXP")
+
+    message = str(error.value)
+    assert "TimeoutError" in message
+    for value in filled.values():
+        assert value not in message
+    assert error.value.__suppress_context__
+
+
 def test_source_keeps_default_timeouts_and_has_no_hash_values():
     import inspect
     import re

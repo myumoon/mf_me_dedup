@@ -70,20 +70,30 @@ def _totp_wait(now: float, interval: int = 30) -> float:
 
 
 def login(page, email, password, totp_secret) -> None:
-    page.goto(TOP_URL)
-    page.get_by_role("button", name="ログイン / 新規登録").click()
-    page.get_by_role("link", name="ログイン", exact=True).first.click()
-    page.get_by_role("textbox", name="メールアドレス").fill(email)
-    page.get_by_role("button", name="ログインする").click()
-    page.get_by_role("textbox", name="パスワード").fill(password)
-    page.get_by_role("button", name="ログインする").click()
-    totp = pyotp.TOTP(_totp_secret(totp_secret))
-    code_box = page.get_by_role("textbox", name="認証コード（数字6桁）")
-    code_box.wait_for()
-    time.sleep(_totp_wait(time.time(), totp.interval))
-    code_box.fill(totp.now())
-    page.get_by_role("button", name="認証する").click()
-    page.wait_for_url(TOP_URL, timeout=LOGIN_WAIT_MS)
+    # Playwright の例外はコールログに入力値（fill("<value>")）を含むので、
+    # どの段階で失敗したかと型名だけの固定メッセージに置き換える。
+    step = "open"
+    try:
+        page.goto(TOP_URL)
+        page.get_by_role("button", name="ログイン / 新規登録").click()
+        page.get_by_role("link", name="ログイン", exact=True).first.click()
+        step = "email"
+        page.get_by_role("textbox", name="メールアドレス").fill(email)
+        page.get_by_role("button", name="ログインする").click()
+        step = "password"
+        page.get_by_role("textbox", name="パスワード").fill(password)
+        page.get_by_role("button", name="ログインする").click()
+        step = "totp"
+        totp = pyotp.TOTP(_totp_secret(totp_secret))
+        code_box = page.get_by_role("textbox", name="認証コード（数字6桁）")
+        code_box.wait_for()
+        time.sleep(_totp_wait(time.time(), totp.interval))
+        code_box.fill(totp.now())
+        page.get_by_role("button", name="認証する").click()
+        step = "wait for the top page"
+        page.wait_for_url(TOP_URL, timeout=LOGIN_WAIT_MS)
+    except Exception as error:
+        raise RuntimeError(f"login failed at {step}: {type(error).__name__}") from None
 
 
 def _months(start: date, end: date) -> list[tuple[int, int]]:
