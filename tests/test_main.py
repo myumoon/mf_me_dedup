@@ -375,7 +375,7 @@ def test_report_is_overwritten_with_success(runtime):
 
 
 def test_exit_texts_are_fixed_and_distinct():
-    texts = [cli.LOGIN_NEEDED_TEXT, *cli.EXIT_TEXTS.values()]
+    texts = [cli.LOGIN_NEEDED_TEXT, cli.ALREADY_RUNNING_TEXT, *cli.EXIT_TEXTS.values()]
     assert set(cli.EXIT_TEXTS) == {1, 2}
     assert len(set(texts)) == len(texts)
     assert all("'" not in text for text in texts)
@@ -488,7 +488,7 @@ def test_running_instance_blocks_main_before_browser(runtime):
     assert code == 1
     assert "Another mf_me_dedup run" in stderr
     assert runtime.sessions == []
-    runtime.notify.assert_called_once_with(cli.EXIT_TEXTS[1])
+    runtime.notify.assert_called_once_with(cli.ALREADY_RUNNING_TEXT)
 
 
 def test_leftover_lock_file_does_not_block(monkeypatch, tmp_path):

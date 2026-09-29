@@ -17,6 +17,7 @@ COUNTERPART = "楽天市場(my Rakuten)"
 
 # 通知の文言は固定。明細の内容・秘密情報を入れない。PowerShell の単一引用符で囲むので ' を含めない。
 LOGIN_NEEDED_TEXT = "MoneyForward ME へのログインが必要です。1Password の承認画面で承認してください。"
+ALREADY_RUNNING_TEXT = "別の実行が動いています。ログイン待ちなら 1Password の承認画面で承認してください。"
 EXIT_TEXTS = {
     1: "エラーまたは金額の不一致がありました。last-run.md を確認してください。",
     2: "MoneyForward ME にログインできませんでした。--login でログインしてください。",
@@ -284,7 +285,8 @@ def main(argv: list[str] | None = None) -> int:
             code = _run(args)
     except AlreadyRunning:
         print("Another mf_me_dedup run is using the profile", file=sys.stderr)
-        code = 1
+        _notify(ALREADY_RUNNING_TEXT)
+        return 1
     if code:
         _notify(EXIT_TEXTS[code])
     return code
