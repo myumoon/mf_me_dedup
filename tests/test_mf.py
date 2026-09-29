@@ -220,3 +220,13 @@ def test_option_value_rejects_missing_or_duplicate(options):
 def test_set_transfer_rejects_unknown_counterpart_before_touching_page():
     with pytest.raises(ValueError):
         mf.set_transfer(object(), row(), "Amazon")
+
+
+def test_source_keeps_default_timeouts_and_has_no_hash_values():
+    import inspect
+    import re
+
+    source = inspect.getsource(mf)
+    assert "timeout=" not in source
+    assert "set_default_timeout" not in source
+    assert not re.search(r"[0-9a-f]{16,}|[A-Za-z0-9+/]{32,}", source)
