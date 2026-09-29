@@ -1,4 +1,5 @@
 from datetime import date
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -97,7 +98,8 @@ def test_months_crosses_years():
 
 
 class FakeResponse:
-    def __init__(self, body):
+    def __init__(self, body, url="https://moneyforward.com/cf/csv"):
+        self.url = url
         self.status = 200
         self.headers = {"content-type": "text/csv; charset=utf-8"}
         self._body = body
@@ -127,6 +129,35 @@ def test_fetch_rows_requests_each_month_and_dedupes():
         "https://moneyforward.com/cf/csv?from=2026/02/01&month=2&year=2026",
     ]
     assert [item["ID"] for item in rows] == ["same-id"]
+
+
+def test_fetch_rows_reports_sign_in_page_as_login_required():
+    # 未ログインでは 302 → id.moneyforward.com/sign_in の HTML が 200 で返る（契約）。
+    response = FakeResponse(b"<html></html>", "https://id.moneyforward.com/sign_in")
+    response.headers = {"content-type": "text/html; charset=utf-8"}
+    request = type("Request", (), {"get": lambda self, url: response})()
+    context = type("Context", (), {"request": request})()
+
+    with pytest.raises(mf.LoginRequired):
+        mf.fetch_rows(context, date(2026, 1, 1), date(2026, 1, 31))
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://id.moneyforward.com/sign_in", True),
+        ("https://id.moneyforward.com/sign_in/password?x=1", True),
+        ("https://id.moneyforward.com/", True),
+        ("https://moneyforward.com/sign_in", True),
+        ("https://moneyforward.com/sign_in/email", True),
+        ("https://moneyforward.com/cf", False),
+        ("https://moneyforward.com/", False),
+        ("https://moneyforward.com/cf?sign_in=1", False),
+        ("https://id.moneyforward.com.example/cf", False),
+    ],
+)
+def test_is_login_url(url, expected):
+    assert mf.is_login_url(url) is expected
 
 
 @pytest.mark.parametrize(
@@ -222,11 +253,58 @@ def test_set_transfer_rejects_unknown_counterpart_before_touching_page():
         mf.set_transfer(object(), row(), "Amazon")
 
 
+def transfer_page(url=mf.CF_URL):
+    page = MagicMock()
+    page.url = url
+    listing = page.locator.return_value
+    listing.inner_text.return_value = "2026/8/25 - 2026/9/24"
+    listing.evaluate_all.return_value = [
+        ["js-transaction-4242", "2026/09/15", "ショップA", "-3,000"]
+    ]
+    return page
+
+
+def test_set_transfer_stops_on_sign_in_page_before_any_click():
+    page = transfer_page("https://id.moneyforward.com/sign_in")
+
+    with pytest.raises(mf.LoginRequired):
+        mf.set_transfer(page, row(), "楽天市場(my Rakuten)")
+
+    page.locator.return_value.locator.return_value.click.assert_not_called()
+    page.get_by_role.assert_not_called()
+
+
+def test_set_transfer_failure_after_execute_names_rid_only():
+    page = transfer_page()
+    icon = page.locator.return_value.locator.return_value
+    icon.wait_for.side_effect = Exception("Timeout <tr>ショップA -3,000 円</tr>")
+
+    with pytest.raises(RuntimeError) as error:
+        mf.set_transfer(page, row(), "楽天市場(my Rakuten)")
+
+    message = str(error.value)
+    assert "4242" in message
+    assert "ショップA" not in message
+    assert "3,000" not in message and "3000" not in message
+    page.get_by_role.assert_called_with("link", name="実行する")
+
+
+def test_login_waits_five_minutes_for_the_top_page(monkeypatch):
+    page = MagicMock()
+    monkeypatch.setattr(mf.time, "sleep", lambda seconds: None)
+
+    mf.login(page, "user@example.test", "password", "JBSWY3DPEHPK3PXP")
+
+    page.wait_for_url.assert_called_once_with(mf.TOP_URL, timeout=5 * 60 * 1000)
+
+
 def test_source_keeps_default_timeouts_and_has_no_hash_values():
     import inspect
     import re
 
     source = inspect.getsource(mf)
+    # 例外はログイン完了の待ち時間だけ（契約 M4-4）。
+    source = source.replace("page.wait_for_url(TOP_URL, timeout=LOGIN_WAIT_MS)", "", 1)
     assert "timeout=" not in source
     assert "set_default_timeout" not in source
     assert not re.search(r"[0-9a-f]{16,}|[A-Za-z0-9+/]{32,}", source)

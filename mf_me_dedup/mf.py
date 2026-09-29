@@ -3,6 +3,7 @@ import io
 import re
 import time
 from datetime import date
+from urllib.parse import urlsplit
 
 import pyotp
 
@@ -23,6 +24,16 @@ CSV_HEADER = [
 SUB_ACCOUNTS = {"楽天市場(my Rakuten)": "楽天市場"}
 MAX_MONTH_MOVES = 36
 TOTP_MIN_REMAINING = 5
+LOGIN_WAIT_MS = 5 * 60 * 1000
+
+
+class LoginRequired(RuntimeError):
+    """MF returned its sign-in page instead of the requested content."""
+
+
+def is_login_url(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.hostname == "id.moneyforward.com" or parts.path.startswith("/sign_in")
 
 # 画面（JIS 系の対応）→ CSV（cp932 の対応）。両側に適用して比べる。
 _CP932_CHARS = str.maketrans(
@@ -72,7 +83,7 @@ def login(page, email, password, totp_secret) -> None:
     time.sleep(_totp_wait(time.time(), totp.interval))
     code_box.fill(totp.now())
     page.get_by_role("button", name="認証する").click()
-    page.wait_for_url(TOP_URL)
+    page.wait_for_url(TOP_URL, timeout=LOGIN_WAIT_MS)
 
 
 def _months(start: date, end: date) -> list[tuple[int, int]]:
@@ -109,6 +120,8 @@ def fetch_rows(context, start: date, end: date) -> list[dict]:
         response = context.request.get(
             f"{CF_URL}/csv?from={year}/{month:02d}/01&month={month}&year={year}"
         )
+        if is_login_url(response.url):
+            raise LoginRequired("MF returned the sign-in page for the CSV request")
         rows += _parse_csv(
             response.status,
             response.headers.get("content-type", ""),
@@ -198,6 +211,8 @@ def set_transfer(page, row: dict, counterpart: str) -> None:
     target = _day(row["日付"])
 
     page.goto(CF_URL)
+    if is_login_url(page.url):
+        raise LoginRequired("MF returned the sign-in page for /cf")
     _show_month(page, target)
     rid = _find_rid(
         page.locator("tr.transaction_list").evaluate_all(_SCREEN_ROWS_JS), row
@@ -208,20 +223,26 @@ def set_transfer(page, row: dict, counterpart: str) -> None:
         raise RuntimeError(f"row {rid} is not a normal entry")
 
     icon.click()
-    page.get_by_role("link", name="実行する").click()
-    line.locator("td:nth-child(9) > .icon-exchange.onchange").wait_for()
-    page.locator(f"#change_act_type_{rid}").click()
+    try:
+        page.get_by_role("link", name="実行する").click()
+        line.locator("td:nth-child(9) > .icon-exchange.onchange").wait_for()
+        page.locator(f"#change_act_type_{rid}").click()
 
-    modal = page.locator("#modal_change_act_type")
-    modal.wait_for()
-    _select_label(modal.locator("#user_asset_act_partner_account_id_hash"), counterpart)
-    sub_select = modal.locator("#user_asset_act_partner_sub_account_id_hash")
-    sub_select.locator("option", has_text=sub_account).first.wait_for(state="attached")
-    _select_label(sub_select, sub_account)
-    modal.get_by_role("button", name="設定を保存").click()
+        modal = page.locator("#modal_change_act_type")
+        modal.wait_for()
+        _select_label(modal.locator("#user_asset_act_partner_account_id_hash"), counterpart)
+        sub_select = modal.locator("#user_asset_act_partner_sub_account_id_hash")
+        sub_select.locator("option", has_text=sub_account).first.wait_for(state="attached")
+        _select_label(sub_select, sub_account)
+        modal.get_by_role("button", name="設定を保存").click()
 
-    line.locator(".transfer_account_box", has_text=counterpart).wait_for(
-        state="attached"
-    )
-    if not _has_class(icon, "onchange"):
+        line.locator(".transfer_account_box", has_text=counterpart).wait_for(
+            state="attached"
+        )
+        done = _has_class(icon, "onchange")
+    except Exception as error:
+        # Playwright の例外は DOM（明細の内容・金額）を含みうるので、型名だけを残す。
+        detail = str(error) if type(error) is RuntimeError else type(error).__name__
+        raise RuntimeError(f"row {rid}: transfer failed after 実行する: {detail}") from error
+    if not done:
         raise RuntimeError(f"row {rid} did not become a transfer")
