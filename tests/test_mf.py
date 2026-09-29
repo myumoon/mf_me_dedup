@@ -1,0 +1,222 @@
+from datetime import date
+
+import pytest
+
+from mf_me_dedup import mf
+
+HEADER = "計算対象,日付,内容,金額（円）,保有金融機関,大項目,中項目,メモ,振替,ID\r\n"
+
+
+def row(row_id="id-1", *, day="2026/09/15", description="ショップA", amount="-3000"):
+    return {
+        "計算対象": "1",
+        "日付": day,
+        "内容": description,
+        "金額（円）": amount,
+        "保有金融機関": "楽天カード",
+        "大項目": "食費",
+        "中項目": "食料品",
+        "メモ": "",
+        "振替": "0",
+        "ID": row_id,
+    }
+
+
+def csv_body(*lines):
+    return (HEADER + "".join(line + "\r\n" for line in lines)).encode("cp932")
+
+
+def test_parse_csv_reads_cp932_rows_as_strings():
+    body = csv_body('1,2026/09/15,ショップ～A,-3000,楽天カード,食費,食料品,"メモ, あり",0,id-1')
+    rows = mf._parse_csv(200, "text/csv; charset=utf-8", body)
+    assert rows == [
+        {
+            "計算対象": "1",
+            "日付": "2026/09/15",
+            "内容": "ショップ～A",
+            "金額（円）": "-3000",
+            "保有金融機関": "楽天カード",
+            "大項目": "食費",
+            "中項目": "食料品",
+            "メモ": "メモ, あり",
+            "振替": "0",
+            "ID": "id-1",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "content_type", "body"),
+    [
+        (302, "text/csv", csv_body()),
+        (500, "text/csv", csv_body()),
+        (200, "text/html; charset=utf-8", "<html>ログイン</html>".encode()),
+        (200, "text/csv", "<html>ログイン</html>".encode("cp932")),
+        (200, "text/csv", "計算対象,日付,内容\r\n".encode("cp932")),
+        (200, "text/csv", b""),
+        (200, "text/csv", b"\xff\xff"),
+    ],
+)
+def test_parse_csv_rejects_non_csv_responses(status, content_type, body):
+    with pytest.raises(RuntimeError):
+        mf._parse_csv(status, content_type, body)
+
+
+def test_select_dedupes_by_id_and_keeps_both_ends():
+    rows = [
+        row("a", day="2026/08/31"),
+        row("b", day="2026/09/01"),
+        row("b", day="2026/09/01"),
+        row("c", day="2026/09/30"),
+        row("d", day="2026/10/01"),
+    ]
+    selected = mf._select(rows, date(2026, 9, 1), date(2026, 9, 30))
+    assert [item["ID"] for item in selected] == ["b", "c"]
+
+
+def test_months_adds_one_month_on_each_side():
+    assert mf._months(date(2026, 9, 1), date(2026, 9, 29)) == [
+        (2026, 8),
+        (2026, 9),
+        (2026, 10),
+    ]
+
+
+def test_months_crosses_years():
+    assert mf._months(date(2025, 12, 20), date(2026, 1, 5)) == [
+        (2025, 11),
+        (2025, 12),
+        (2026, 1),
+        (2026, 2),
+    ]
+    assert mf._months(date(2026, 1, 3), date(2026, 1, 3)) == [
+        (2025, 12),
+        (2026, 1),
+        (2026, 2),
+    ]
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.status = 200
+        self.headers = {"content-type": "text/csv; charset=utf-8"}
+        self._body = body
+
+    def body(self):
+        return self._body
+
+
+class FakeRequest:
+    def __init__(self):
+        self.urls = []
+
+    def get(self, url):
+        self.urls.append(url)
+        return FakeResponse(
+            csv_body("1,2026/01/10,ショップA,-100,楽天カード,食費,食料品,,0,same-id")
+        )
+
+
+def test_fetch_rows_requests_each_month_and_dedupes():
+    request = FakeRequest()
+    context = type("Context", (), {"request": request})()
+    rows = mf.fetch_rows(context, date(2026, 1, 1), date(2026, 1, 31))
+    assert request.urls == [
+        "https://moneyforward.com/cf/csv?from=2025/12/01&month=12&year=2025",
+        "https://moneyforward.com/cf/csv?from=2026/01/01&month=1&year=2026",
+        "https://moneyforward.com/cf/csv?from=2026/02/01&month=2&year=2026",
+    ]
+    assert [item["ID"] for item in rows] == ["same-id"]
+
+
+@pytest.mark.parametrize(
+    ("now", "wait"),
+    [(0.0, 0.0), (20.0, 0.0), (25.0, 0.0), (25.5, 5.0), (29.0, 1.5), (59.9, 0.6)],
+)
+def test_totp_wait(now, wait):
+    assert mf._totp_wait(now) == pytest.approx(wait)
+
+
+def test_totp_secret_removes_spaces():
+    assert mf._totp_secret(" ABCD EFGH\tIJKL ") == "ABCDEFGHIJKL"
+
+
+def test_period_parses_unpadded_dates():
+    assert mf._period("2026/8/25 - 2026/9/24") == (date(2026, 8, 25), date(2026, 9, 24))
+    assert mf._period(" 2025/12/25 - 2026/1/23\n") == (
+        date(2025, 12, 25),
+        date(2026, 1, 23),
+    )
+
+
+def test_period_rejects_other_text():
+    with pytest.raises(RuntimeError):
+        mf._period("2026年9月")
+
+
+def test_needs_previous():
+    period = "2026/8/25 - 2026/9/24"
+    assert mf._needs_previous(period, date(2026, 8, 24))
+    assert not mf._needs_previous(period, date(2026, 8, 25))
+    assert not mf._needs_previous(period, date(2026, 9, 24))
+    with pytest.raises(RuntimeError):
+        mf._needs_previous(period, date(2026, 9, 25))
+
+
+def screen(rid, *, day="2026/09/15", description="ショップA", amount="-3,000円"):
+    return [f"js-transaction-{rid}", day, description, amount]
+
+
+def test_find_rid_returns_the_unique_match():
+    rows = [
+        screen("1", day="2026/09/14"),
+        screen("2", description=" ショップA \n"),
+        screen("3", amount="-300"),
+        screen("4", description="ショップB"),
+    ]
+    assert mf._find_rid(rows, row()) == "2"
+
+
+def test_find_rid_reads_amounts_with_commas():
+    rows = [screen("7", amount="-1,234,567")]
+    assert mf._find_rid(rows, row(amount="-1234567")) == "7"
+
+
+def test_find_rid_replaces_wave_dash():
+    rows = [screen("5", description="ショップ〜A")]
+    assert mf._find_rid(rows, row(description="ショップ～A")) == "5"
+
+
+def test_find_rid_rejects_no_match():
+    with pytest.raises(RuntimeError, match="found 0") as error:
+        mf._find_rid([screen("1", amount="-2,000")], row("secret-free-id"))
+    assert "ショップA" not in str(error.value)
+    assert "3000" not in str(error.value)
+
+
+def test_find_rid_rejects_duplicates():
+    with pytest.raises(RuntimeError, match="found 2"):
+        mf._find_rid([screen("1"), screen("2")], row())
+
+
+def test_find_rid_ignores_rows_without_rid():
+    assert mf._find_rid([["other", "2026/09/15", "ショップA", "-3,000"], screen("9")], row()) == "9"
+
+
+def test_option_value_matches_trimmed_label():
+    options = [["  楽天市場(my Rakuten) ", "hash-a"], ["楽天カード", "hash-b"]]
+    assert mf._option_value(options, "楽天市場(my Rakuten)") == "hash-a"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [[["楽天市場 楽天ブックス", "x"]], [["楽天市場", "x"], [" 楽天市場 ", "y"]]],
+)
+def test_option_value_rejects_missing_or_duplicate(options):
+    with pytest.raises(RuntimeError):
+        mf._option_value(options, "楽天市場")
+
+
+def test_set_transfer_rejects_unknown_counterpart_before_touching_page():
+    with pytest.raises(ValueError):
+        mf.set_transfer(object(), row(), "Amazon")
