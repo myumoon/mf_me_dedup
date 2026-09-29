@@ -1,91 +1,127 @@
 # 導入手順
 
+利用者の Windows PC で、インストール済みの Google Chrome と専用のプロファイルを使って実行する。ログインはセッションが切れたときだけ行い、パスワードと TOTP の秘密鍵は、そのたびに 1Password CLI（`op`）で読む（Windows Hello などでの承認が必要）。
+
 ## 前提
 
+- Windows と Google Chrome。
 - MoneyForward ME のプレミアムプランを利用し、「楽天カード」と「楽天市場(my Rakuten)」を連携する。
 - MoneyForward ME の2段階認証を認証アプリ方式にする。
-- Python 3.12 と uv を用意する。
+- 1Password のデスクトップアプリ。
+- Python 3.12 と uv。
 
 ## 2段階認証と1Password
 
 1. MoneyForward ME のアカウント設定で、2段階認証を認証アプリ方式に切り替える。
-2. 表示された QR コードを1Passwordで読み取り、MF ME 用のログイン項目にワンタイムパスワードを登録する。初回確認コードを入力して設定を完了する。
-3. 1Password に保存した同じ TOTP 秘密鍵を、実行環境の `MF_TOTP_SECRET` として登録する。
+2. 表示された QR コードを 1Password で読み取り、MF ME 用のログイン項目にワンタイムパスワードを登録する。初回確認コードを入力して設定を完了する。
 
-## GitHub Actions で実行する
+## 1Password CLI の導入と連携
 
-明細の内容は Job Summary と、エラー時に保存するスクリーンショットに含まれる。以下のワークフローは**非公開の実行用リポジトリ**だけに置く。公開リポジトリにはワークフロー、秘密情報、実データを置かない。
+1. 1Password CLI を入れる（例: `winget install AgileBits.1Password.CLI`）。`op` が PATH から実行できることを確かめる。
+2. 1Password のデスクトップアプリで「設定 > 開発者」を開き、「1Password CLI と連携」を有効にする。Windows Hello でのロック解除も有効にしておく。
+3. MF ME 用の項目のフィールド ID を確かめる。
 
-1. 非公開リポジトリ `mf_me_dedup_runner` を作成する。
-2. `Settings > Secrets and variables > Actions` から Repository secrets を追加する。
-   - `MF_EMAIL`: MoneyForward ME のメールアドレス
-   - `MF_PASSWORD`: MoneyForward ME のパスワード
-   - `MF_TOTP_SECRET`: 1Password に登録したものと同じ TOTP 秘密鍵
-3. 次の内容を `.github/workflows/run.yml` にコピーする。`<owner>` と `<SHA>` は実行用リポジトリや各 Action の実際の値に置き換える。公開リポジトリの `ref` にはタグでなくコミット SHA を指定する。
+   ```powershell
+   op item get "<item>" --vault "<vault>" --format json
+   ```
 
-```yaml
-name: mf_me_dedup
-on:
-  schedule: [{ cron: "0 22 * * *" }]   # 07:00 JST
-  workflow_dispatch:
-    inputs:
-      args: { description: "mf_me_dedup args", default: "--dry-run" }
-permissions: { contents: read }
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@<SHA>
-        with: { repository: <owner>/mf_me_dedup, ref: <commit SHA> }
-      - uses: astral-sh/setup-uv@<SHA>
-      - run: uv sync --frozen && uv run playwright install --with-deps chromium
-      - run: uv run python -m mf_me_dedup $ARGS
-        env:
-          ARGS: ${{ inputs.args }}
-          MF_EMAIL: ${{ secrets.MF_EMAIL }}
-          MF_PASSWORD: ${{ secrets.MF_PASSWORD }}
-          MF_TOTP_SECRET: ${{ secrets.MF_TOTP_SECRET }}
-      - if: failure()
-        uses: actions/upload-artifact@<SHA>
-        with: { name: error, path: artifacts/, retention-days: 3 }
+   `fields[].id` を見る。ログイン項目のユーザー名・パスワードは通常 `username` / `password`。ワンタイムパスワードのフィールドは `TOTP_<英数字>` の形の ID になる（ラベルは日本語なので、参照には ID を使う）。OTP フィールドを `op read` すると、TOTP の秘密鍵が返る。
+
+## `.env` を作る
+
+リポジトリのルートに `.env` を作り、値ではなく `op://` の参照を書く。
+
+```dotenv
+MF_EMAIL=op://<vault>/<item>/username
+MF_PASSWORD=op://<vault>/<item>/password
+MF_TOTP_SECRET=op://<vault>/<item>/<TOTP のフィールド ID>
 ```
 
-`inputs.args` は手動実行時に使われ、schedule 実行時は空になるため通常実行となる。入力値は `run:` に直接埋め込まず、環境変数を介して渡す。
+- どれかが無い、または `op://` で始まらない場合は、ブラウザを起動せずに終了コード1で終わる。
+- `.env` に秘密情報そのものは入らないが、vault・項目の名前が分かるので、リポジトリには入れない（`.gitignore` 済み）。
 
-## ローカルで実行する
-
-リポジトリのルートで依存関係と Chromium を準備する。
+## 依存関係を入れる
 
 ```powershell
 uv sync --frozen
-uv run playwright install chromium
 ```
 
-ルートに `.env` を作り、次の値を設定する。
+ブラウザはインストール済みの Chrome（`channel="chrome"`）を使うので、`playwright install` は不要。
 
-```dotenv
-MF_EMAIL=your-email@example.com
-MF_PASSWORD=your-password
-MF_TOTP_SECRET=your-totp-secret
+## 初回ログイン
+
+```powershell
+uv run --env-file .env python -m mf_me_dedup --login
 ```
 
-`.env` は平文のパスワードと TOTP 秘密鍵を含み、実質的に1要素認証になる。同期フォルダには置かず、自分以外が読めない場所に保管する。
+1. Chrome が専用プロファイルで開く（`--login` のときは最小化しない）。
+2. 1Password の承認画面が出たら承認する。
+3. メールアドレス・パスワード・認証コードが自動で入力される。トップページに移るまで最大5分待つので、MF から追加の確認を求められたら、開いている Chrome の画面で対応する。
+4. ログインできたら終了コード0で終わる。セッションはプロファイルに残り、次からはログインしない。
 
-まず変更なしで結果を確認する。
+`--login` はログイン状態を確かめずにログイン画面へ進むので、ログイン済みのときには使わない。
+
+続けて、変更せずに結果を確かめる。
 
 ```powershell
 uv run --env-file .env python -m mf_me_dedup --dry-run
 ```
 
-## Windows タスクスケジューラで毎日実行する
+引数:
 
-GitHub Actions からログインできない場合は、Windows 上でタスクを作り、毎日1回実行する。
+| 引数 | 意味 |
+|---|---|
+| `--dry-run` | 判定結果だけを出し、変更しない |
+| `--since YYYY-MM-DD` | 処理するカード明細の開始日（既定は今日(JST) − 30日） |
+| `--max-changes N` | MATCH がこれを超えたら1件も変更せずにエラー（既定 10） |
+| `--login` | ログインだけして終了する |
 
-1. トリガーを毎日 07:00 に設定する。
-2. 操作の「プログラム/スクリプト」に uv の `uv.exe` のパスを設定する。
-3. 引数に `run --env-file .env python -m mf_me_dedup` を設定する。
-4. 「開始 (オプション)」にリポジトリのルートディレクトリを設定する。
+## ログインが必要になったとき
+
+`--login` 以外では、最初に家計簿（`/cf`）を開いてログイン状態を確かめる。セッションが切れていてログイン画面が出た場合:
+
+1. 「ログインが必要です」というトースト通知が出る。
+2. 1Password の承認画面で承認する。放置して承認がタイムアウトしても、承認されるかキャンセルされるまで何度でも承認を求め直す。
+3. 承認するとログインし、そのまま通常の処理を続ける。
+4. 承認画面でキャンセルすると、明細を変更せずに終了コード2で終わり、通知が出る。あとで `--login` を実行してログインする。
+
+処理の途中（CSV の取得、振替の変更）でログイン画面が返った場合は、ログインし直さずに終了コード2で終わる。
+
+## タスクスケジューラで毎日実行する
+
+「タスクの作成」で次のように設定する。
+
+- 全般: 「ユーザーがログオンしているときのみ実行する」（通知と 1Password の承認画面を出すため）。
+- トリガー: 毎日（例: 07:00）。
+- 操作: プログラムの開始。
+  - 「プログラム/スクリプト」: `uv.exe` と同じフォルダーにある `uvw.exe` のフルパス（コンソール画面を出さない）。
+  - 「引数の追加」: `run --env-file .env python -m mf_me_dedup`
+  - 「開始 (オプション)」: リポジトリのルートディレクトリ。
+- 設定:
+  - 「タスクが既に実行中の場合に適用される規則」: 「新しいインスタンスを開始しない」。
+  - 「タスクを停止するまでの時間」: オフ（承認を待つ間に止められないように）。
+
+定期実行を有効にする前に、未処理の過去分を `--dry-run` で確かめてから処理しておく（未処理が残っていると、`--max-changes` を超えて止まる）。
+
+## プロファイル
+
+- 場所: `%LOCALAPPDATA%\mf_me_dedup\profile`。MF のログイン状態（Cookie）が入るので、パスワードと同じように扱う。同期フォルダーやバックアップの共有先に置かない。
+- このツール専用。普段使いの Chrome で開いたり、ほかのサイトに使ったりしない。
+- 同じプロファイルを使う実行が動いている間に別の実行を始めると、ブラウザを起動せずに終了コード1で終わる（`%LOCALAPPDATA%\mf_me_dedup\run.lock` への OS のロックで判定する。異常終了した場合もロックは自動で外れる）。
+- ログイン状態をやり直したいときは、どの実行も動いていないことを確かめてから `profile` フォルダーを削除し、`--login` を実行する。
+
+## 終了コードと結果
+
+| 終了コード | 意味 | 通知 |
+|---|---|---|
+| 0 | 成功 | なし |
+| 1 | エラー、または AMOUNT_MISMATCH が1件以上 | あり |
+| 2 | ログインが必要（承認のキャンセル、処理途中のログイン画面） | あり |
+
+- 標準出力には件数（`MATCH=2 AMOUNT_MISMATCH=0 changed=2`）だけを出す。エラーの内容は標準エラーに出す。
+- 結果は毎回 `%LOCALAPPDATA%\mf_me_dedup\last-run.md` に上書き保存する。1行目が結果の種類（`SUCCESS` / `AMOUNT_MISMATCH` / `ERROR` / `LOGIN_REQUIRED`）、続けて件数、エラーのときはそのメッセージ、最後に明細ごとの表（日付、内容、金額、判定、市場明細日）。別の実行が動いていて終了した場合は書き換えない。
+- エラー時は、ブラウザの画面を `%LOCALAPPDATA%\mf_me_dedup\error.png` に保存する。
+- 通知の文言は固定で、明細の内容や秘密情報は入らない。`last-run.md` と `error.png` には明細の内容が入る。
 
 ## 振替を元に戻す手順
 
