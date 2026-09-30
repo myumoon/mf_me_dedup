@@ -1,13 +1,34 @@
+import os
+import subprocess
+import sys
+import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from mf_me_dedup import __main__ as cli
+from mf_me_dedup import mf
 from mf_me_dedup.rakuten import Result
+
+REAL_NOTIFY = cli._notify
+REAL_OP_READ = cli._op_read
+REAL_CONFIRM_LOGIN = cli._confirm_login
+SIGN_IN_URL = "https://id.moneyforward.com/sign_in"
+REFERENCES = {
+    "MF_EMAIL": "op://vault/item/username",
+    "MF_PASSWORD": "op://vault/item/password",
+    "MF_TOTP_SECRET": "op://vault/item/totp",
+}
+SECRETS = {
+    "op://vault/item/username": "user@example.test",
+    "op://vault/item/password": "password-secret",
+    "op://vault/item/totp": "totp-secret",
+}
 
 
 def row(row_id, *, transfer="0", description="ショップA 楽天市場店 ラクテンイチバ700001"):
@@ -26,8 +47,8 @@ def row(row_id, *, transfer="0", description="ショップA 楽天市場店 ラ�
 
 
 @pytest.fixture
-def runtime(monkeypatch):
-    page = SimpleNamespace(closed=False, screenshots_before_close=[])
+def runtime(monkeypatch, tmp_path):
+    page = SimpleNamespace(closed=False, screenshots_before_close=[], url=mf.CF_URL)
 
     def screenshot(*, path):
         if page.closed:
@@ -35,34 +56,55 @@ def runtime(monkeypatch):
         page.screenshots_before_close.append(path)
 
     page.screenshot = Mock(side_effect=screenshot)
+    page.goto = Mock()
     context = object()
-    login = Mock()
+    events = []
+    sessions = []
+    login = Mock(side_effect=lambda *args: events.append("login"))
     fetch_rows = Mock()
     set_transfer = Mock()
     match = Mock(return_value=[])
+    notify = Mock(side_effect=lambda text: events.append(("notify", text)))
+    confirm = Mock(side_effect=lambda: events.append("confirm") or True)
+
+    def op_read(reference):
+        events.append("op_read")
+        return SECRETS[reference]
 
     @contextmanager
-    def browser_session(headed):
+    def browser_session(minimized):
+        sessions.append(minimized)
         try:
             yield page, context
         finally:
             page.closed = True
 
     monkeypatch.setattr(cli, "_browser_session", browser_session)
+    monkeypatch.setattr(cli, "_op_read", Mock(side_effect=op_read))
+    monkeypatch.setattr(cli, "_notify", notify)
+    monkeypatch.setattr(cli, "_confirm_login", confirm)
     monkeypatch.setattr(cli.mf, "login", login)
     monkeypatch.setattr(cli.mf, "fetch_rows", fetch_rows)
     monkeypatch.setattr(cli.mf, "set_transfer", set_transfer)
     monkeypatch.setattr(cli.rakuten, "match", match)
-    monkeypatch.setenv("MF_EMAIL", "user@example.test")
-    monkeypatch.setenv("MF_PASSWORD", "password-secret")
-    monkeypatch.setenv("MF_TOTP_SECRET", "totp-secret")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    for name, reference in REFERENCES.items():
+        monkeypatch.setenv(name, reference)
+    app_dir = tmp_path / "mf_me_dedup"
     return SimpleNamespace(
         page=page,
         context=context,
+        events=events,
+        sessions=sessions,
         login=login,
         fetch_rows=fetch_rows,
         set_transfer=set_transfer,
         match=match,
+        notify=notify,
+        confirm=confirm,
+        op_read=cli._op_read,
+        report=app_dir / "last-run.md",
+        error_png=str(app_dir / "error.png"),
     )
 
 
@@ -77,22 +119,208 @@ def matched(row_data):
     return Result("MATCH", row_data, date(2026, 9, 10))
 
 
-def test_missing_credentials_exits_before_login(runtime, monkeypatch):
-    monkeypatch.delenv("MF_PASSWORD")
+# --- 引数と参照 ---------------------------------------------------------------
 
-    code, _, _ = invoke([])
 
-    assert code != 0
+@pytest.mark.parametrize("value", [None, "", "plain-password", "https://example.test/x"])
+def test_invalid_reference_exits_1_before_browser(runtime, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MF_PASSWORD")
+    else:
+        monkeypatch.setenv("MF_PASSWORD", value)
+
+    code, _, stderr = invoke([])
+
+    assert code == 1
+    assert "MF_PASSWORD" in stderr
+    if value:
+        assert value not in stderr + runtime.report.read_text(encoding="utf-8")
+    assert runtime.sessions == []
+    runtime.op_read.assert_not_called()
+    runtime.notify.assert_called_once_with(cli.EXIT_TEXTS[1])
+
+
+@pytest.mark.parametrize("flag", ["--login-only", "--headed"])
+def test_removed_flags_are_rejected(flag):
+    with redirect_stderr(StringIO()), pytest.raises(SystemExit):
+        cli.main([flag])
+
+
+# --- ログイン状態の確認とログイン -------------------------------------------------
+
+
+def test_login_flag_logs_in_and_stops(runtime):
+    code, _, _ = invoke(["--login"])
+
+    assert code == 0
+    assert runtime.sessions == [False]
+    runtime.login.assert_called_once_with(
+        runtime.page, "user@example.test", "password-secret", "totp-secret"
+    )
+    runtime.page.goto.assert_not_called()
+    runtime.fetch_rows.assert_not_called()
+    runtime.notify.assert_not_called()
+    runtime.confirm.assert_not_called()
+
+
+def test_login_flag_returns_to_dialog_after_timeout(runtime):
+    runtime.op_read.side_effect = [cli.AuthorizationTimeout(), *SECRETS.values()]
+
+    code, _, _ = invoke(["--login"])
+
+    assert code == 0
+    assert runtime.confirm.call_count == 1
+    assert runtime.op_read.call_count == 4
+    runtime.login.assert_called_once_with(
+        runtime.page, "user@example.test", "password-secret", "totp-secret"
+    )
+
+
+def test_login_flag_cancel_after_timeout_exits_2(runtime):
+    runtime.op_read.side_effect = [cli.AuthorizationTimeout()]
+    runtime.confirm.side_effect = lambda: False
+
+    code, _, _ = invoke(["--login"])
+
+    assert code == 2
+    assert runtime.op_read.call_count == 1
     runtime.login.assert_not_called()
 
 
-def test_login_only_stops_after_login(runtime):
-    code, _, _ = invoke(["--login-only"])
+def test_logged_in_run_checks_cf_first_and_skips_login(runtime):
+    runtime.fetch_rows.return_value = []
+
+    code, _, _ = invoke(["--dry-run"])
 
     assert code == 0
-    runtime.login.assert_called_once()
+    assert runtime.sessions == [True]
+    runtime.page.goto.assert_called_once_with(mf.CF_URL)
+    runtime.op_read.assert_not_called()
+    runtime.login.assert_not_called()
+    runtime.notify.assert_not_called()
+    runtime.confirm.assert_not_called()
+
+
+def test_sign_in_page_notifies_then_logs_in_and_continues(runtime):
+    runtime.page.url = SIGN_IN_URL
+    card = row("card-1")
+    runtime.fetch_rows.side_effect = [[card], [row("card-1", transfer="1")]]
+    runtime.match.return_value = [matched(card)]
+
+    code, _, _ = invoke([])
+
+    assert code == 0
+    assert runtime.events == [
+        ("notify", cli.LOGIN_NEEDED_TEXT), "confirm", "op_read", "op_read", "op_read", "login"
+    ]
+    runtime.set_transfer.assert_called_once()
+
+
+def test_dialog_cancel_exits_2_without_op_or_changes(runtime):
+    runtime.page.url = SIGN_IN_URL
+    runtime.confirm.side_effect = lambda: False
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    runtime.op_read.assert_not_called()
+    runtime.login.assert_not_called()
     runtime.fetch_rows.assert_not_called()
     runtime.set_transfer.assert_not_called()
+    assert runtime.report.read_text(encoding="utf-8").splitlines()[0] == "LOGIN_REQUIRED"
+    assert runtime.notify.call_args_list[-1].args == (cli.EXIT_TEXTS[2],)
+
+
+@pytest.mark.parametrize("timeouts", [1, 2])
+def test_authorization_timeout_returns_to_dialog(runtime, timeouts):
+    runtime.page.url = SIGN_IN_URL
+    runtime.fetch_rows.return_value = []
+    # 2回目の読み取り（パスワード）でタイムアウトしても、ダイアログからやり直す。
+    runtime.op_read.side_effect = (
+        ["user@example.test", cli.AuthorizationTimeout()]
+        + [cli.AuthorizationTimeout()] * (timeouts - 1)
+        + list(SECRETS.values())
+    )
+
+    code, _, _ = invoke(["--dry-run"])
+
+    assert code == 0
+    assert runtime.confirm.call_count == timeouts + 1
+    runtime.login.assert_called_once_with(
+        runtime.page, "user@example.test", "password-secret", "totp-secret"
+    )
+
+
+def test_cancel_after_timeout_exits_2_without_changes(runtime):
+    runtime.page.url = SIGN_IN_URL
+    answers = iter([True, False])
+    runtime.confirm.side_effect = lambda: next(answers)
+    runtime.op_read.side_effect = [cli.AuthorizationTimeout()]
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    assert runtime.confirm.call_count == 2
+    assert runtime.op_read.call_count == 1
+    runtime.login.assert_not_called()
+    runtime.fetch_rows.assert_not_called()
+    runtime.set_transfer.assert_not_called()
+
+
+def test_interrupted_op_reports_fixed_text(runtime, monkeypatch):
+    runtime.page.url = SIGN_IN_URL
+    monkeypatch.setattr(cli, "_op_read", REAL_OP_READ)
+    fake_op(monkeypatch, (1, "", " \n"))
+
+    code, _, stderr = invoke([])
+
+    assert code == 1
+    report = runtime.report.read_text(encoding="utf-8")
+    assert cli.OP_INTERRUPTED_TEXT in stderr
+    assert cli.OP_INTERRUPTED_TEXT in report
+    assert "op read failed" not in stderr + report
+    runtime.set_transfer.assert_not_called()
+
+
+def test_dismissed_authorization_exits_2_without_changes(runtime):
+    runtime.page.url = SIGN_IN_URL
+    runtime.op_read.side_effect = cli.LoginCancelled("dismissed")
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    runtime.login.assert_not_called()
+    runtime.fetch_rows.assert_not_called()
+    runtime.set_transfer.assert_not_called()
+    assert runtime.report.read_text(encoding="utf-8").splitlines()[0] == "LOGIN_REQUIRED"
+    assert runtime.notify.call_args_list[-1].args == (cli.EXIT_TEXTS[2],)
+
+
+def test_sign_in_during_processing_exits_2_without_relogin(runtime):
+    runtime.fetch_rows.side_effect = mf.LoginRequired("sign-in page")
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    runtime.op_read.assert_not_called()
+    runtime.login.assert_not_called()
+    runtime.set_transfer.assert_not_called()
+    runtime.notify.assert_called_once_with(cli.EXIT_TEXTS[2])
+
+
+def test_sign_in_during_transfer_exits_2(runtime):
+    card = row("card-1")
+    runtime.fetch_rows.return_value = [card]
+    runtime.match.return_value = [matched(card)]
+    runtime.set_transfer.side_effect = mf.LoginRequired("sign-in page")
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    runtime.login.assert_not_called()
+
+
+# --- 既存の流れ ---------------------------------------------------------------
 
 
 def test_change_limit_prevents_every_transfer(runtime):
@@ -102,7 +330,7 @@ def test_change_limit_prevents_every_transfer(runtime):
 
     code, _, _ = invoke(["--max-changes", "1"])
 
-    assert code != 0
+    assert code == 1
     runtime.set_transfer.assert_not_called()
 
 
@@ -139,10 +367,10 @@ def test_transfer_delta_rejects_another_existing_id(runtime):
     ]
     runtime.match.return_value = [matched(card)]
 
-    with pytest.raises(RuntimeError):
-        invoke([])
+    code, _, _ = invoke([])
 
-    runtime.page.screenshot.assert_called_once_with(path="artifacts/error.png")
+    assert code == 1
+    runtime.page.screenshot.assert_called_once_with(path=runtime.error_png)
 
 
 def test_transfer_delta_rejects_target_that_remains_untransferred(runtime):
@@ -150,10 +378,10 @@ def test_transfer_delta_rejects_target_that_remains_untransferred(runtime):
     runtime.fetch_rows.side_effect = [[card], [row("card-1")]]
     runtime.match.return_value = [matched(card)]
 
-    with pytest.raises(RuntimeError):
-        invoke([])
+    code, _, _ = invoke([])
 
-    runtime.page.screenshot.assert_called_once_with(path="artifacts/error.png")
+    assert code == 1
+    runtime.page.screenshot.assert_called_once_with(path=runtime.error_png)
 
 
 def test_new_rows_are_excluded_from_transfer_delta(runtime):
@@ -167,29 +395,6 @@ def test_new_rows_are_excluded_from_transfer_delta(runtime):
     code, _, _ = invoke([])
 
     assert code == 0
-
-
-@pytest.mark.parametrize("secret", ["password-secret", "totp-secret"])
-def test_exception_text_does_not_expose_credentials(runtime, secret):
-    runtime.login.side_effect = RuntimeError(secret)
-    output = StringIO()
-
-    with redirect_stdout(output), pytest.raises(RuntimeError) as error:
-        cli.main([])
-
-    assert secret not in str(error.value)
-    assert secret not in output.getvalue()
-    runtime.page.screenshot.assert_called_once_with(path="artifacts/error.png")
-
-
-def test_error_screenshot_is_captured_before_browser_session_closes(runtime):
-    runtime.login.side_effect = RuntimeError("login failed")
-
-    with pytest.raises(RuntimeError):
-        cli.main([])
-
-    assert runtime.page.closed
-    assert runtime.page.screenshots_before_close == ["artifacts/error.png"]
 
 
 def test_default_since_and_fetch_range_use_jst_today(runtime, monkeypatch):
@@ -215,18 +420,271 @@ def test_today_is_read_in_fixed_jst(runtime, monkeypatch):
     now.assert_called_once_with(timezone(timedelta(hours=9)))
 
 
-def test_job_summary_receives_result_table(runtime, monkeypatch, tmp_path):
-    card = row("card-1")
-    runtime.fetch_rows.return_value = [card]
-    runtime.match.return_value = [matched(card)]
-    summary = tmp_path / "summary.md"
-    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+# --- 秘密情報・結果・通知 --------------------------------------------------------
 
-    code, output, _ = invoke(["--dry-run"])
+
+@pytest.mark.parametrize("secret", ["user@example.test", "password-secret", "totp-secret"])
+def test_errors_do_not_expose_secrets_read_from_op(runtime, secret):
+    runtime.page.url = SIGN_IN_URL
+    runtime.login.side_effect = RuntimeError(f"login failed near {secret}")
+
+    code, stdout, stderr = invoke([])
+
+    assert code == 1
+    report = runtime.report.read_text(encoding="utf-8")
+    assert "login failed near [REDACTED]" in stderr
+    for text in (stdout, stderr, report, repr(runtime.notify.call_args_list)):
+        assert secret not in text
+    assert runtime.page.closed
+    assert runtime.page.screenshots_before_close == [runtime.error_png]
+
+
+def test_last_run_report_and_stdout(runtime):
+    card = row("card-1")
+    other = row("card-2", description="ショップB 楽天市場店 ラクテンイチバ700002")
+    runtime.fetch_rows.return_value = [card, other]
+    runtime.match.return_value = [
+        matched(card),
+        Result("AMOUNT_MISMATCH", other, date(2026, 9, 11)),
+    ]
+
+    code, stdout, _ = invoke(["--dry-run"])
+
+    assert code == 1
+    assert stdout == "MATCH=1 AMOUNT_MISMATCH=1 changed=0\n"
+    lines = runtime.report.read_text(encoding="utf-8").splitlines()
+    assert lines[:2] == ["AMOUNT_MISMATCH", "MATCH=1 AMOUNT_MISMATCH=1 changed=0"]
+    assert "| 日付 | 内容 | 金額（円） | 判定 | 市場明細日 |" in lines
+    assert "| 2026/09/15 | ショップB 楽天市場店 ラクテンイチバ700002 | -3000 | AMOUNT_MISMATCH | 2026-09-11 |" in lines
+    runtime.notify.assert_called_once_with(cli.EXIT_TEXTS[1])
+
+
+def test_report_is_overwritten_with_success(runtime):
+    runtime.report.parent.mkdir(parents=True)
+    runtime.report.write_text("old\n", encoding="utf-8")
+    runtime.fetch_rows.return_value = []
+
+    code, _, _ = invoke(["--dry-run"])
 
     assert code == 0
-    assert "MATCH=1" in output
-    content = summary.read_text(encoding="utf-8")
-    assert "| 日付 | 内容 | 金額（円） | 判定 | 市場明細日 |" in content
-    assert "password-secret" not in output + content
-    assert "totp-secret" not in output + content
+    assert runtime.report.read_text(encoding="utf-8").splitlines()[:2] == [
+        "SUCCESS",
+        "MATCH=0 AMOUNT_MISMATCH=0 changed=0",
+    ]
+
+
+def test_exit_texts_are_fixed_and_distinct():
+    texts = [cli.LOGIN_NEEDED_TEXT, cli.ALREADY_RUNNING_TEXT, *cli.EXIT_TEXTS.values()]
+    assert set(cli.EXIT_TEXTS) == {1, 2}
+    assert len(set(texts)) == len(texts)
+    assert all("'" not in text for text in texts)
+    assert "OK" in cli.LOGIN_NEEDED_TEXT
+    assert "OK" in cli.LOGIN_DIALOG_TEXT and "キャンセル" in cli.LOGIN_DIALOG_TEXT
+
+
+def test_notify_runs_powershell_with_fixed_text(monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    cli._notify(cli.EXIT_TEXTS[2])
+
+    command = run.call_args.args[0]
+    assert command[:2] == ["powershell", "-NoProfile"]
+    assert f"CreateTextNode('{cli.EXIT_TEXTS[2]}')" in command[-1]
+
+
+def test_notification_failure_keeps_exit_code(runtime, monkeypatch):
+    monkeypatch.setattr(cli, "_notify", REAL_NOTIFY)
+    monkeypatch.setattr(cli.subprocess, "run", Mock(side_effect=OSError("no powershell")))
+    runtime.fetch_rows.side_effect = mf.LoginRequired("sign-in page")
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+
+
+# --- op read ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stderr", "kind"),
+    [
+        ('[ERROR] 2026/09/30 12:00:00 authorization timeout\n', "retry"),
+        ('[ERROR] 2026/09/30 12:00:00 authorization prompt dismissed, please try again\n', "cancelled"),
+        ('[ERROR] 2026/09/30 12:00:00 "vault" isn\'t a vault in this account\n', "error"),
+        ("", "error"),
+    ],
+)
+def test_op_error_kind(stderr, kind):
+    assert cli._op_error_kind(stderr) == kind
+
+
+def fake_op(monkeypatch, *outcomes):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        returncode, stdout, stderr = outcomes[len(calls) - 1]
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    return calls
+
+
+def test_op_read_strips_newline(monkeypatch):
+    calls = fake_op(monkeypatch, (0, "JBSW Y3DP\n", ""))
+
+    assert cli._op_read("op://vault/item/totp") == "JBSW Y3DP"
+    assert [command for command, _ in calls] == [["op", "read", "op://vault/item/totp"]]
+    assert calls[0][1]["encoding"] == "utf-8"
+
+
+def test_op_read_timeout_raises_without_retrying(monkeypatch):
+    calls = fake_op(monkeypatch, (1, "", "[ERROR] authorization timeout\n"))
+
+    with pytest.raises(cli.AuthorizationTimeout):
+        cli._op_read("op://vault/item/totp")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("stderr", ["", " \n", "\r\n\t"])
+def test_op_read_empty_stderr_is_interrupted(monkeypatch, stderr):
+    fake_op(monkeypatch, (1, "", stderr))
+
+    with pytest.raises(RuntimeError) as error:
+        cli._op_read("op://vault/item/password")
+
+    assert str(error.value) == cli.OP_INTERRUPTED_TEXT
+    assert not isinstance(error.value, (cli.LoginCancelled, cli.AuthorizationTimeout))
+
+
+@pytest.mark.parametrize(("answer", "expected"), [(1, True), (2, False)])
+def test_confirm_login_uses_topmost_okcancel_without_foreground(monkeypatch, answer, expected):
+    import ctypes
+
+    message_box = Mock(return_value=answer)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=SimpleNamespace(MessageBoxW=message_box)), raising=False)
+
+    assert REAL_CONFIRM_LOGIN() is expected
+    _, text, title, flags = message_box.call_args.args
+    assert (text, title) == (cli.LOGIN_DIALOG_TEXT, "mf_me_dedup")
+    assert flags == 0x1 | 0x40 | 0x40000
+    assert not flags & 0x10000  # MB_SETFOREGROUND
+
+
+def test_op_read_dismissed_raises_login_cancelled(monkeypatch):
+    fake_op(monkeypatch, (1, "", "[ERROR] authorization prompt dismissed\n"))
+
+    with pytest.raises(cli.LoginCancelled):
+        cli._op_read("op://vault/item/password")
+
+
+def test_op_read_other_failure_is_an_error(monkeypatch):
+    fake_op(monkeypatch, (1, "", "[ERROR] item not found\n"))
+
+    with pytest.raises(RuntimeError) as error:
+        cli._op_read("op://vault/item/password")
+
+    assert not isinstance(error.value, cli.LoginCancelled)
+    assert "item not found" in str(error.value)
+
+
+def test_op_read_missing_cli_is_an_error(monkeypatch):
+    monkeypatch.setattr(cli.subprocess, "run", Mock(side_effect=FileNotFoundError()))
+
+    with pytest.raises(RuntimeError, match="op"):
+        cli._op_read("op://vault/item/password")
+
+
+# --- ロックとブラウザ ------------------------------------------------------------
+
+
+def test_lock_rejects_a_second_holder(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    with cli._run_lock():
+        with pytest.raises(cli.AlreadyRunning):
+            with cli._run_lock():
+                pass
+    with cli._run_lock():
+        pass
+
+
+def test_running_instance_blocks_main_before_browser(runtime):
+    with cli._run_lock():
+        code, _, stderr = invoke([])
+
+    assert code == 1
+    assert "Another mf_me_dedup run" in stderr
+    assert runtime.sessions == []
+    runtime.notify.assert_called_once_with(cli.ALREADY_RUNNING_TEXT)
+
+
+def test_leftover_lock_file_does_not_block(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    (tmp_path / "mf_me_dedup").mkdir()
+    (tmp_path / "mf_me_dedup" / "run.lock").write_text("stale", encoding="utf-8")
+
+    with cli._run_lock():
+        pass
+
+
+def test_killed_holder_does_not_block_next_run(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time\nfrom mf_me_dedup import __main__ as cli\n"
+            "with cli._run_lock():\n    print('locked', flush=True)\n    time.sleep(60)\n",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "LOCALAPPDATA": str(tmp_path)},
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout.readline().strip() == b"locked"
+        with pytest.raises(cli.AlreadyRunning):
+            with cli._run_lock():
+                pass
+    finally:
+        holder.kill()
+        holder.wait()
+        holder.stdout.close()
+
+    # OS がロックを解放するまで少しかかることがある（LockFile の仕様）。
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with cli._run_lock():
+                break
+        except cli.AlreadyRunning:
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+
+
+@pytest.mark.parametrize(("minimized", "args"), [(True, ["--start-minimized"]), (False, [])])
+def test_browser_session_uses_chrome_with_dedicated_profile(monkeypatch, tmp_path, minimized, args):
+    import playwright.sync_api
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    context = Mock(pages=["first-page"])
+    chromium = Mock()
+    chromium.launch_persistent_context.return_value = context
+
+    @contextmanager
+    def sync_playwright():
+        yield SimpleNamespace(chromium=chromium)
+
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright", sync_playwright)
+
+    with cli._browser_session(minimized) as (page, yielded):
+        assert (page, yielded) == ("first-page", context)
+
+    chromium.launch_persistent_context.assert_called_once_with(
+        str(tmp_path / "mf_me_dedup" / "profile"),
+        channel="chrome",
+        headless=False,
+        args=args,
+    )
+    context.close.assert_called_once()
