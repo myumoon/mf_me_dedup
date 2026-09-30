@@ -257,7 +257,7 @@ def transfer_page(url=mf.CF_URL):
     page = MagicMock()
     page.url = url
     listing = page.locator.return_value
-    listing.inner_text.return_value = "2026/8/25 - 2026/9/24"
+    page.wait_for_function.return_value.json_value.return_value = "2026/8/25 - 2026/9/24"
     listing.evaluate_all.return_value = [
         ["js-transaction-4242", "2026/09/15", "ショップA", "-3,000"]
     ]
@@ -334,3 +334,33 @@ def test_source_keeps_default_timeouts_and_has_no_hash_values():
     assert "timeout=" not in source
     assert "set_default_timeout" not in source
     assert not re.search(r"[0-9a-f]{16,}|[A-Za-z0-9+/]{32,}", source)
+
+
+def test_show_month_waits_for_period_before_reading_and_after_each_move():
+    periods = iter(["2026/8/25 - 2026/9/24", "2026/7/24 - 2026/8/24"])
+    calls = []
+
+    class Handle:
+        def __init__(self, value):
+            self.value = value
+
+        def json_value(self):
+            return self.value
+
+    class Page:
+        def wait_for_function(self, script, arg=None):
+            calls.append(arg)
+            return Handle(next(periods))
+
+        def locator(self, selector):
+            return self
+
+        def get_by_text(self, text):
+            return self
+
+        def click(self):
+            calls.append("click")
+
+    mf._show_month(Page(), date(2026, 8, 1))
+
+    assert calls == [None, "click", "2026/8/25 - 2026/9/24"]
