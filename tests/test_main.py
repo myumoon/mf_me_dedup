@@ -16,6 +16,8 @@ from mf_me_dedup import mf
 from mf_me_dedup.rakuten import Result
 
 REAL_NOTIFY = cli._notify
+REAL_OP_READ = cli._op_read
+REAL_CONFIRM_LOGIN = cli._confirm_login
 SIGN_IN_URL = "https://id.moneyforward.com/sign_in"
 REFERENCES = {
     "MF_EMAIL": "op://vault/item/username",
@@ -63,6 +65,7 @@ def runtime(monkeypatch, tmp_path):
     set_transfer = Mock()
     match = Mock(return_value=[])
     notify = Mock(side_effect=lambda text: events.append(("notify", text)))
+    confirm = Mock(side_effect=lambda: events.append("confirm") or True)
 
     def op_read(reference):
         events.append("op_read")
@@ -79,6 +82,7 @@ def runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_browser_session", browser_session)
     monkeypatch.setattr(cli, "_op_read", Mock(side_effect=op_read))
     monkeypatch.setattr(cli, "_notify", notify)
+    monkeypatch.setattr(cli, "_confirm_login", confirm)
     monkeypatch.setattr(cli.mf, "login", login)
     monkeypatch.setattr(cli.mf, "fetch_rows", fetch_rows)
     monkeypatch.setattr(cli.mf, "set_transfer", set_transfer)
@@ -97,6 +101,7 @@ def runtime(monkeypatch, tmp_path):
         set_transfer=set_transfer,
         match=match,
         notify=notify,
+        confirm=confirm,
         op_read=cli._op_read,
         report=app_dir / "last-run.md",
         error_png=str(app_dir / "error.png"),
@@ -155,6 +160,31 @@ def test_login_flag_logs_in_and_stops(runtime):
     runtime.page.goto.assert_not_called()
     runtime.fetch_rows.assert_not_called()
     runtime.notify.assert_not_called()
+    runtime.confirm.assert_not_called()
+
+
+def test_login_flag_returns_to_dialog_after_timeout(runtime):
+    runtime.op_read.side_effect = [cli.AuthorizationTimeout(), *SECRETS.values()]
+
+    code, _, _ = invoke(["--login"])
+
+    assert code == 0
+    assert runtime.confirm.call_count == 1
+    assert runtime.op_read.call_count == 4
+    runtime.login.assert_called_once_with(
+        runtime.page, "user@example.test", "password-secret", "totp-secret"
+    )
+
+
+def test_login_flag_cancel_after_timeout_exits_2(runtime):
+    runtime.op_read.side_effect = [cli.AuthorizationTimeout()]
+    runtime.confirm.side_effect = lambda: False
+
+    code, _, _ = invoke(["--login"])
+
+    assert code == 2
+    assert runtime.op_read.call_count == 1
+    runtime.login.assert_not_called()
 
 
 def test_logged_in_run_checks_cf_first_and_skips_login(runtime):
@@ -168,6 +198,7 @@ def test_logged_in_run_checks_cf_first_and_skips_login(runtime):
     runtime.op_read.assert_not_called()
     runtime.login.assert_not_called()
     runtime.notify.assert_not_called()
+    runtime.confirm.assert_not_called()
 
 
 def test_sign_in_page_notifies_then_logs_in_and_continues(runtime):
@@ -179,8 +210,76 @@ def test_sign_in_page_notifies_then_logs_in_and_continues(runtime):
     code, _, _ = invoke([])
 
     assert code == 0
-    assert runtime.events == [("notify", cli.LOGIN_NEEDED_TEXT), "op_read", "op_read", "op_read", "login"]
+    assert runtime.events == [
+        ("notify", cli.LOGIN_NEEDED_TEXT), "confirm", "op_read", "op_read", "op_read", "login"
+    ]
     runtime.set_transfer.assert_called_once()
+
+
+def test_dialog_cancel_exits_2_without_op_or_changes(runtime):
+    runtime.page.url = SIGN_IN_URL
+    runtime.confirm.side_effect = lambda: False
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    runtime.op_read.assert_not_called()
+    runtime.login.assert_not_called()
+    runtime.fetch_rows.assert_not_called()
+    runtime.set_transfer.assert_not_called()
+    assert runtime.report.read_text(encoding="utf-8").splitlines()[0] == "LOGIN_REQUIRED"
+    assert runtime.notify.call_args_list[-1].args == (cli.EXIT_TEXTS[2],)
+
+
+@pytest.mark.parametrize("timeouts", [1, 2])
+def test_authorization_timeout_returns_to_dialog(runtime, timeouts):
+    runtime.page.url = SIGN_IN_URL
+    runtime.fetch_rows.return_value = []
+    # 2回目の読み取り（パスワード）でタイムアウトしても、ダイアログからやり直す。
+    runtime.op_read.side_effect = (
+        ["user@example.test", cli.AuthorizationTimeout()]
+        + [cli.AuthorizationTimeout()] * (timeouts - 1)
+        + list(SECRETS.values())
+    )
+
+    code, _, _ = invoke(["--dry-run"])
+
+    assert code == 0
+    assert runtime.confirm.call_count == timeouts + 1
+    runtime.login.assert_called_once_with(
+        runtime.page, "user@example.test", "password-secret", "totp-secret"
+    )
+
+
+def test_cancel_after_timeout_exits_2_without_changes(runtime):
+    runtime.page.url = SIGN_IN_URL
+    answers = iter([True, False])
+    runtime.confirm.side_effect = lambda: next(answers)
+    runtime.op_read.side_effect = [cli.AuthorizationTimeout()]
+
+    code, _, _ = invoke([])
+
+    assert code == 2
+    assert runtime.confirm.call_count == 2
+    assert runtime.op_read.call_count == 1
+    runtime.login.assert_not_called()
+    runtime.fetch_rows.assert_not_called()
+    runtime.set_transfer.assert_not_called()
+
+
+def test_interrupted_op_reports_fixed_text(runtime, monkeypatch):
+    runtime.page.url = SIGN_IN_URL
+    monkeypatch.setattr(cli, "_op_read", REAL_OP_READ)
+    fake_op(monkeypatch, (1, "", " \n"))
+
+    code, _, stderr = invoke([])
+
+    assert code == 1
+    report = runtime.report.read_text(encoding="utf-8")
+    assert cli.OP_INTERRUPTED_TEXT in stderr
+    assert cli.OP_INTERRUPTED_TEXT in report
+    assert "op read failed" not in stderr + report
+    runtime.set_transfer.assert_not_called()
 
 
 def test_dismissed_authorization_exits_2_without_changes(runtime):
@@ -379,6 +478,8 @@ def test_exit_texts_are_fixed_and_distinct():
     assert set(cli.EXIT_TEXTS) == {1, 2}
     assert len(set(texts)) == len(texts)
     assert all("'" not in text for text in texts)
+    assert "OK" in cli.LOGIN_NEEDED_TEXT
+    assert "OK" in cli.LOGIN_DIALOG_TEXT and "キャンセル" in cli.LOGIN_DIALOG_TEXT
 
 
 def test_notify_runs_powershell_with_fixed_text(monkeypatch):
@@ -430,17 +531,45 @@ def fake_op(monkeypatch, *outcomes):
     return calls
 
 
-def test_op_read_retries_on_timeout_and_strips_newline(monkeypatch):
-    calls = fake_op(
-        monkeypatch,
-        (1, "", "[ERROR] authorization timeout\n"),
-        (1, "", "[ERROR] authorization timeout\n"),
-        (0, "JBSW Y3DP\n", ""),
-    )
+def test_op_read_strips_newline(monkeypatch):
+    calls = fake_op(monkeypatch, (0, "JBSW Y3DP\n", ""))
 
     assert cli._op_read("op://vault/item/totp") == "JBSW Y3DP"
-    assert [command for command, _ in calls] == [["op", "read", "op://vault/item/totp"]] * 3
+    assert [command for command, _ in calls] == [["op", "read", "op://vault/item/totp"]]
     assert calls[0][1]["encoding"] == "utf-8"
+
+
+def test_op_read_timeout_raises_without_retrying(monkeypatch):
+    calls = fake_op(monkeypatch, (1, "", "[ERROR] authorization timeout\n"))
+
+    with pytest.raises(cli.AuthorizationTimeout):
+        cli._op_read("op://vault/item/totp")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("stderr", ["", " \n", "\r\n\t"])
+def test_op_read_empty_stderr_is_interrupted(monkeypatch, stderr):
+    fake_op(monkeypatch, (1, "", stderr))
+
+    with pytest.raises(RuntimeError) as error:
+        cli._op_read("op://vault/item/password")
+
+    assert str(error.value) == cli.OP_INTERRUPTED_TEXT
+    assert not isinstance(error.value, (cli.LoginCancelled, cli.AuthorizationTimeout))
+
+
+@pytest.mark.parametrize(("answer", "expected"), [(1, True), (2, False)])
+def test_confirm_login_uses_topmost_okcancel_without_foreground(monkeypatch, answer, expected):
+    import ctypes
+
+    message_box = Mock(return_value=answer)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=SimpleNamespace(MessageBoxW=message_box)), raising=False)
+
+    assert REAL_CONFIRM_LOGIN() is expected
+    _, text, title, flags = message_box.call_args.args
+    assert (text, title) == (cli.LOGIN_DIALOG_TEXT, "mf_me_dedup")
+    assert flags == 0x1 | 0x40 | 0x40000
+    assert not flags & 0x10000  # MB_SETFOREGROUND
 
 
 def test_op_read_dismissed_raises_login_cancelled(monkeypatch):

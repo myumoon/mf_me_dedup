@@ -16,8 +16,16 @@ CREDENTIAL_NAMES = ("MF_EMAIL", "MF_PASSWORD", "MF_TOTP_SECRET")
 COUNTERPART = "楽天市場(my Rakuten)"
 
 # 通知の文言は固定。明細の内容・秘密情報を入れない。PowerShell の単一引用符で囲むので ' を含めない。
-LOGIN_NEEDED_TEXT = "MoneyForward ME へのログインが必要です。1Password の承認画面で承認してください。"
-ALREADY_RUNNING_TEXT = "別の実行が動いています。ログイン待ちなら 1Password の承認画面で承認してください。"
+LOGIN_NEEDED_TEXT = "MoneyForward ME へのログインが必要です。表示されたダイアログで OK を押してください。"
+ALREADY_RUNNING_TEXT = "別の実行が動いています。ログイン待ちなら、確認ダイアログか 1Password の承認画面を確認してください。"
+# 確認ダイアログの文言も固定。秘密情報・明細を入れない。
+LOGIN_DIALOG_TEXT = (
+    "MoneyForward ME へのログインが必要です。\n\n"
+    "OK: 1Password の承認画面に進みます（約60秒で消えます）。\n"
+    "キャンセル: 今回の実行をやめます（明細は変更しません）。"
+)
+_MB_OKCANCEL, _MB_ICONINFORMATION, _MB_TOPMOST, _IDOK = 0x1, 0x40, 0x40000, 1
+OP_INTERRUPTED_TEXT = "1Password CLI was interrupted"
 EXIT_TEXTS = {
     1: "エラーまたは金額の不一致がありました。last-run.md を確認してください。",
     2: "MoneyForward ME にログインできませんでした。--login でログインしてください。",
@@ -41,6 +49,10 @@ class AlreadyRunning(Exception):
 
 
 class LoginCancelled(Exception):
+    pass
+
+
+class AuthorizationTimeout(Exception):
     pass
 
 
@@ -116,25 +128,36 @@ def _op_error_kind(stderr: str) -> str:
     return "error"
 
 
+def _confirm_login() -> bool:
+    """押されるまで消えない OK / キャンセルのダイアログ。フォーカスは奪わない（MB_SETFOREGROUND なし）。"""
+    import ctypes
+
+    flags = _MB_OKCANCEL | _MB_ICONINFORMATION | _MB_TOPMOST
+    return ctypes.windll.user32.MessageBoxW(None, LOGIN_DIALOG_TEXT, "mf_me_dedup", flags) == _IDOK
+
+
 def _op_read(reference: str) -> str:
-    while True:
-        try:
-            completed = subprocess.run(
-                ["op", "read", reference],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-        except FileNotFoundError:
-            raise RuntimeError("1Password CLI (op) was not found on PATH") from None
-        if completed.returncode == 0:
-            return completed.stdout.removesuffix("\n")
-        kind = _op_error_kind(completed.stderr)
-        if kind == "cancelled":
-            raise LoginCancelled("1Password authorization was dismissed")
-        if kind == "error":
-            raise RuntimeError(f"op read failed: {completed.stderr.strip()}")
-        # authorization timeout: 承認されるかキャンセルされるまで待ち続ける。
+    try:
+        completed = subprocess.run(
+            ["op", "read", reference],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except FileNotFoundError:
+        raise RuntimeError("1Password CLI (op) was not found on PATH") from None
+    if completed.returncode == 0:
+        return completed.stdout.removesuffix("\n")
+    stderr = completed.stderr.strip()
+    if not stderr:
+        # タスクの終了で一緒に止まった等。標準エラーが空なので固定の文言にする。
+        raise RuntimeError(OP_INTERRUPTED_TEXT)
+    kind = _op_error_kind(stderr)
+    if kind == "cancelled":
+        raise LoginCancelled("1Password authorization was dismissed")
+    if kind == "retry":
+        raise AuthorizationTimeout("1Password authorization timed out")
+    raise RuntimeError(f"op read failed: {stderr}")
 
 
 def _references() -> dict[str, str]:
@@ -146,12 +169,21 @@ def _references() -> dict[str, str]:
     return references
 
 
-def _login(page, references: dict[str, str], secrets: list[str]) -> None:
-    values = []
-    for name in CREDENTIAL_NAMES:
-        values.append(_op_read(references[name]))
-        secrets.append(values[-1])
-    mf.login(page, *values)
+def _login(page, references: dict[str, str], secrets: list[str], *, confirm: bool) -> None:
+    """confirm=True なら先に確認ダイアログを出す。承認がタイムアウトしたら、ダイアログからやり直す。"""
+    while True:
+        if confirm and not _confirm_login():
+            raise LoginCancelled("Login was cancelled in the confirmation dialog")
+        values = []
+        try:
+            for name in CREDENTIAL_NAMES:
+                values.append(_op_read(references[name]))
+                secrets.append(values[-1])
+        except AuthorizationTimeout:
+            confirm = True
+            continue
+        mf.login(page, *values)
+        return
 
 
 def _redact(message: str, secrets: list[str]) -> str:
@@ -210,13 +242,13 @@ def _process(args, state, secrets: list[str]) -> tuple[int, str]:
     with _browser_session(minimized=not args.login) as (page, context):
         try:
             if args.login:
-                _login(page, references, secrets)
+                _login(page, references, secrets, confirm=False)
                 return 0, "SUCCESS"
 
             page.goto(mf.CF_URL)
             if mf.is_login_url(page.url):
                 _notify(LOGIN_NEEDED_TEXT)
-                _login(page, references, secrets)
+                _login(page, references, secrets, confirm=True)
 
             rows = mf.fetch_rows(context, start, today)
             state.results = rakuten.match(rows, since)
