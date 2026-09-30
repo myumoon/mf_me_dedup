@@ -185,13 +185,13 @@ def test_period_rejects_other_text():
         mf._period("2026年9月")
 
 
-def test_needs_previous():
+def test_month_step():
+    # MF は最後に表示した月を覚えているので、/cf を開くと過去の月のことがある。両方向に進む。
     period = "2026/8/25 - 2026/9/24"
-    assert mf._needs_previous(period, date(2026, 8, 24))
-    assert not mf._needs_previous(period, date(2026, 8, 25))
-    assert not mf._needs_previous(period, date(2026, 9, 24))
-    with pytest.raises(RuntimeError):
-        mf._needs_previous(period, date(2026, 9, 25))
+    assert mf._month_step(period, date(2026, 8, 24)) == "◄"
+    assert mf._month_step(period, date(2026, 8, 25)) is None
+    assert mf._month_step(period, date(2026, 9, 24)) is None
+    assert mf._month_step(period, date(2026, 9, 25)) == "►"
 
 
 def screen(rid, *, day="2026/09/15", description="ショップA", amount="-3,000円"):
