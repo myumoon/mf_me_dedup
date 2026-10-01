@@ -150,24 +150,37 @@ def _period(text: str) -> tuple[date, date]:
     return date(*values[:3]), date(*values[3:])
 
 
-def _needs_previous(text: str, target: date) -> bool:
+def _month_step(text: str, target: date) -> str | None:
+    """表示中の月から target の月へ進むボタン。表示中の月に入っていれば None。"""
     first, last = _period(text)
+    if target < first:
+        return "◄"
     if target > last:
-        raise RuntimeError("target date is newer than the displayed month")
-    return target < first
+        return "►"
+    return None
+
+
+# 見出しは読み込み中・月の移動中に "Loading..." になる。期間の形になり、前の値から変わるまで待つ。
+_PERIOD_JS = r"""previous => {
+    const text = document.querySelector('#calendar h2')?.innerText || '';
+    return text !== previous
+        && /^\s*\d{4}\/\d{1,2}\/\d{1,2}\s*-\s*\d{4}\/\d{1,2}\/\d{1,2}\s*$/.test(text)
+        ? text : false;
+}"""
+
+
+def _wait_period(page, previous: str | None = None) -> str:
+    return page.wait_for_function(_PERIOD_JS, arg=previous).json_value()
 
 
 def _show_month(page, target: date) -> None:
-    heading = page.locator("#calendar h2")
+    text = _wait_period(page)
     for _ in range(MAX_MONTH_MOVES):
-        text = heading.inner_text()
-        if not _needs_previous(text, target):
+        step = _month_step(text, target)
+        if step is None:
             return
-        page.locator("#calendar").get_by_text("◄").click()
-        page.wait_for_function(
-            "text => document.querySelector('#calendar h2')?.innerText !== text",
-            arg=text,
-        )
+        page.locator("#calendar").get_by_text(step).click()
+        text = _wait_period(page, text)
     raise RuntimeError("target month was not found")
 
 
