@@ -15,7 +15,8 @@ def _day(row: dict) -> date:
 
 
 def _key(row: dict) -> str:
-    return re.sub(r"\s*ラクテンイチバ\d+$", "", row["内容"]).strip()
+    # 注文番号は「ラクテンイチバ<数字>」か「 <6桁>」の形で末尾に付く（楽天ブックスは後者）。
+    return re.sub(r"(\s*ラクテンイチバ\d+|\s+\d{6})$", "", row["内容"]).strip()
 
 
 def _reserve_group(

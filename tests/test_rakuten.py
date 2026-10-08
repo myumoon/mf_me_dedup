@@ -93,6 +93,20 @@ def test_case_04_truncated_card_store_key_matches_market_prefix():
     ]
 
 
+def test_order_number_suffix_with_space_is_stripped_from_store_key():
+    result = match(
+        [
+            card("2026-09-28", "楽天ブックス 705542", -1980),
+            market("2026-09-05", "楽天ブックス Toes, Ears, & Nose!", -1980),
+        ],
+        date(2026, 9, 1),
+    )
+
+    assert [(item.kind, item.market_date) for item in result] == [
+        ("MATCH", date(2026, 9, 5))
+    ]
+
+
 def test_case_05_processed_card_reserves_its_market_group():
     result = match(
         [
